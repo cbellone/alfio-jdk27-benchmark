@@ -1,0 +1,10 @@
+{"title":"Load Benchmark","slug":"load-bench","description":[{"lang":"en","body":"benchmark event"}],
+ "location":{"fullAddress":"Pollegio 6742 Switzerland","coordinate":{"latitude":"46.36","longitude":"8.94"}},
+ "timezone":"Europe/Zurich","startDate":"2027-06-01T09:00:00","endDate":"2027-06-01T18:00:00",
+ "websiteUrl":"https://alf.io","termsAndConditionsUrl":"https://alf.io","privacyPolicyUrl":"https://alf.io",
+ "imageUrl":"http://localhost:8099/logo.png",
+ "tickets":{"freeOfCharge":false,"max":50000,"currency":"CHF","taxPercentage":7.7,"taxIncludedInPrice":true,
+   "paymentMethods":["OFFLINE","ON_SITE"],
+   "categories":[
+     {"name":"Standard","description":[{"lang":"en","body":"standard"}],"maxTickets":25000,"accessRestricted":false,"price":50,"startSellingDate":"2026-01-01T00:00:00","endSellingDate":"2027-05-01T00:00:00"},
+     {"name":"Premium","description":[{"lang":"en","body":"premium"}],"maxTickets":25000,"accessRestricted":false,"price":120,"startSellingDate":"2026-01-01T00:00:00","endSellingDate":"2027-05-01T00:00:00"}]}}
