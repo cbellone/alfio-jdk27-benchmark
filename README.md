@@ -20,10 +20,17 @@ The AOT configurations run with `-XX:AOTMode=on`, so the JVM fails at startup in
 ## How it works
 
 1. **Images**: built from the alf.io repository (`./gradlew distribution`, then `docker build build/dockerize`).
-   - `old`: the Dockerfile of the main branch, with `jdk.jfr` added to the `jlink` modules (JFR is needed for the measurements).
+   - `old`: the Dockerfile of the main branch.
    - `aot`: the Dockerfile with JDK 27, the Leyden AOT cache and ParallelGC.
-   - `aot-workload`: created from `aot` by [`scripts/train-aot.sh`](scripts/train-aot.sh), which runs the application under load
-     with `-XX:AOTCacheOutput` and copies the new cache on top of the image ([`docker/workload-aot/Dockerfile`](docker/workload-aot/Dockerfile)).
+
+   The alf.io images don't include the `jdk.jfr` module, which the benchmark needs to record JFR data. Before building them:
+   - `old` and `aot`: add `jdk.jfr` to the `--add-modules` list of the `jlink` command.
+   - `aot` only: add `--add-modules jdk.jfr` to the AOT cache training command and to the `CMD`.
+     The JVM uses the AOT cache only if the modules match the training run, and starting a recording adds `jdk.jfr`:
+     without this change the cache is disabled, and with `-XX:AOTMode=on` the container doesn't start.
+
+   `aot-workload` is created from `aot` by [`scripts/train-aot.sh`](scripts/train-aot.sh), which runs the application under load
+   with `-XX:AOTCacheOutput` and copies the new cache on top of the image ([`docker/workload-aot/Dockerfile`](docker/workload-aot/Dockerfile)).
 2. **Template database**: [`scripts/prepare-template.sh`](scripts/prepare-template.sh) creates an API key and a published
    event with 50,000 seats. Every run starts from a fresh copy of this database.
 3. **Workload**: [`PurchaseJourneySimulation`](src/gatling/java/alfio/bench/PurchaseJourneySimulation.java) (Gatling, Java DSL).
