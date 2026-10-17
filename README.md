@@ -1,54 +1,86 @@
-# alf.io: JDK 25 vs JDK 27 benchmark
+# alf.io: JDK 25 vs JDK 27 + Leyden AOT cache
 
-Compares the memory footprint, GC, JIT and CPU usage of [alf.io](https://github.com/alfio-event/alf.io)
-running on JDK 25 and JDK 27, under the same fixed-throughput workload.
+Benchmark suite behind the blog post
+[Running alf.io on JDK 27: less memory, faster warm-up, and a few traps](https://ticketguy.dev/blogs/2026-10-17-jdk27-memory/).
+
+It compares startup time, warm-up, memory footprint, GC, JIT and CPU usage of [alf.io](https://github.com/alfio-event/alf.io)
+in different Docker images, under the same fixed-throughput workload.
+
+## Configurations
+
+| Name | Image | JVM | GC | Heap | Startup optimization |
+|---|---|---|---|---|---|
+| `old` | `alfio-bench3:old` | Azul Zulu 25 | G1 | `-Xms512m -Xmx512m` | AppCDS archive (not used, see the post) |
+| `aot` | `alfio-bench3:jdk27-aot` | Temurin 27 | ParallelGC | `-Xms384m -Xmx384m` | AOT cache trained at startup, during `docker build` |
+| `aot-workload` | `alfio-bench3:jdk27-aot-workload` | Temurin 27 | ParallelGC | `-Xms384m -Xmx384m` | AOT cache trained with 5 minutes of this workload |
+
+The configurations are defined in [`scripts/configs.sh`](scripts/configs.sh).
+The AOT configurations run with `-XX:AOTMode=on`, so the JVM fails at startup instead of silently ignoring the cache.
 
 ## How it works
 
-1. **Images**: two alf.io Docker images, built from the same jar and the same Dockerfile, with a different base image
-   (`eclipse-temurin:25-alpine` / `eclipse-temurin:27-alpine`) and `jdk.jfr` included in the jlinked runtime:
-   ```shell
-   # in the alf.io repository
-   ./gradlew distribution
-   docker build --build-arg JDK_IMAGE=eclipse-temurin:25-alpine --build-arg EXTRA_JLINK_MODULES=jdk.jfr -t alfio-bench2:jdk25 build/dockerize
-   docker build --build-arg JDK_IMAGE=eclipse-temurin:27-alpine --build-arg EXTRA_JLINK_MODULES=jdk.jfr -t alfio-bench2:jdk27 build/dockerize
-   ```
+1. **Images**: built from the alf.io repository (`./gradlew distribution`, then `docker build build/dockerize`).
+   - `old`: the Dockerfile of the main branch, with `jdk.jfr` added to the `jlink` modules (JFR is needed for the measurements).
+   - `aot`: the Dockerfile with JDK 27, the Leyden AOT cache and ParallelGC.
+   - `aot-workload`: created from `aot` by [`scripts/train-aot.sh`](scripts/train-aot.sh), which runs the application under load
+     with `-XX:AOTCacheOutput` and copies the new cache on top of the image ([`docker/workload-aot/Dockerfile`](docker/workload-aot/Dockerfile)).
 2. **Template database**: [`scripts/prepare-template.sh`](scripts/prepare-template.sh) creates an API key and a published
    event with 50,000 seats. Every run starts from a fresh copy of this database.
 3. **Workload**: [`PurchaseJourneySimulation`](src/gatling/java/alfio/bench/PurchaseJourneySimulation.java) (Gatling, Java DSL).
    Open model: journeys arrive at a fixed rate, regardless of the server response time. A journey is 3 anonymous
-   page views followed by a purchase (reserve, attendee data, confirm). Admin API calls (event statistics, attendees export)
-   run alongside. Every random choice is derived from the journey index, so all runs send the same traffic.
+   visits to the event page followed by a purchase (reserve, attendee data, confirm), about 22 HTTP requests on average.
+   Admin API calls (event statistics, attendees export) run alongside. Every random choice is derived from the journey index,
+   so all runs send the same traffic.
 4. **Capacity**: [`scripts/capacity.sh`](scripts/capacity.sh) finds the maximum sustainable rate of a configuration
    (p95 < 500 ms, errors < 1%), with probes of increasing rate after a warm-up.
-   The measured runs use **80% of the maximum rate of the slowest configuration**.
-5. **Measured runs**: [`scripts/run.sh`](scripts/run.sh):
+5. **Measured runs**: [`scripts/run.sh`](scripts/run.sh), at **80% of the maximum rate of the slowest configuration**:
    `30s idle | 2 min ramp-up | 3 min warm-up | 8 min measurement | 60s idle`.
-   Only the measurement window is analyzed.
+   The configurations are alternated, 3 runs each ([`scripts/series.sh`](scripts/series.sh)).
 6. **Analysis**: [`analysis/Analyze.java`](analysis/Analyze.java) (JBang) reads the JFR recordings with the
-   `jdk.jfr.consumer` API, plus `pidstat` and the client-side latencies, and compares the medians per configuration.
+   `jdk.jfr.consumer` API, plus `pidstat` and the client-side latencies, and compares the medians per configuration,
+   separately for the warm-up and the measurement window.
+   [`analysis/Charts.java`](analysis/Charts.java) renders the SVG charts of the blog post.
 
 ## What is collected
 
 | Source | Data |
 |---|---|
+| Startup | time from `docker run` to the first successful health check, and Spring's own startup time |
 | JFR (`settings=profile`, `jdk.Compilation#threshold=0ms`) | RSS, heap after GC, committed heap, metaspace, GC pauses, every JIT compilation (duration, tier), compiler statistics |
 | Native Memory Tracking | committed native memory, by category |
-| `pidstat -t -u` | CPU usage of every JVM thread, grouped by component: GC, JIT compilers, JFR, VM, application |
+| `pidstat -t -u` | CPU usage of every JVM thread, grouped by component: GC, JIT compilers, JFR, VM, Jetty, scheduled jobs |
 | Gatling | latency of every request (client side) |
 | `/proc/<pid>/status` | RSS of the Java process, every 2 seconds |
 
-The server container is pinned to 2 cores (`--cpuset-cpus=2,3`, `--memory=2g`); the load generator runs on the other cores.
+The server container is pinned to 2 CPUs (`--cpuset-cpus=2,3`, `--memory=2g`) and the load generator to the others (`taskset`, CPUs 4-13).
+Adjust `SERVER_CPUS` and `LOADGEN_CPUS` to your machine: on the laptop used for the blog post (Intel Core Ultra 7 155U),
+CPUs 2 and 3 are the two hardware threads of one performance core, and CPUs 4-13 are the efficiency cores.
 
 ## Running
 
+Requirements: Docker, a PostgreSQL container named `alfio-main-postgres` with an `alfio` database, JDK 25+, JBang,
+`pidstat` (sysstat), `taskset`, `bc`.
+
 ```shell
 export ALFIO_DEV_PROPERTIES=/path/to/alf.io/application-dev.properties
-scripts/prepare-template.sh alfio-bench2:jdk27
-scripts/capacity.sh alfio-bench2:jdk25 capacity-jdk25-default
-scripts/run.sh alfio-bench2:jdk25 load-jdk25-default-1 <rate>
-scripts/run.sh alfio-bench2:jdk25 load-jdk25-xmx256-1 <rate> "-Xms256m -Xmx256m"
+# Gatling runs in Gradle's JVM: set this if JAVA_HOME points to a JDK older than 25
+export BENCH_JAVA_HOME=/path/to/jdk-25
+
+# once: template database, and the image with the workload-trained AOT cache
+scripts/prepare-template.sh alfio-bench3:jdk27-aot
+scripts/train-aot.sh alfio-bench3:jdk27-aot alfio-bench3:jdk27-aot-workload 5 300 "-Xms384m -Xmx384m"
+
+# capacity search (old, aot), then the measured series at 80% of the slower maximum rate (a few hours)
+setsid nohup scripts/benchmark.sh > results/benchmark.log 2>&1 < /dev/null &
+
+# analysis and charts
 jbang analysis/Analyze.java results
+jbang analysis/Charts.java results charts
 ```
 
-Requirements: Docker, a PostgreSQL container named `alfio-main-postgres`, JDK 25, JBang, `pidstat` (sysstat), `taskset`.
+The scripts skip the steps that already have a result, so `benchmark.sh` can be stopped and started again.
+`Analyze.java` writes `results/summary.md`, `results/summary.csv` and `results/timeline.csv`.
+
+## License
+
+[MIT](LICENSE)

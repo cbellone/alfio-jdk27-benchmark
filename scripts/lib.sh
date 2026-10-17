@@ -16,7 +16,7 @@ if ! [[ "$java_major" =~ ^[0-9]+$ ]] || [ "$java_major" -lt 25 ]; then
   exit 1
 fi
 
-# the server gets 2 dedicated cores, the load generator runs on the others
+# the server gets 2 dedicated CPUs, the load generator runs on the others (adjust them to your machine)
 SERVER_CPUS=${SERVER_CPUS:-2,3}
 LOADGEN_CPUS=${LOADGEN_CPUS:-4-13}
 
