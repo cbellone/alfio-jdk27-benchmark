@@ -1,7 +1,9 @@
 # alf.io: JDK 25 vs JDK 27 + Leyden AOT cache
 
 Benchmark suite behind the blog post
-[Running alf.io on JDK 27: less memory, faster warm-up, and a few traps](https://ticketguy.dev/blogs/2026-10-17-jdk27-memory/).
+[Spring Boot on JDK 27 with Leyden: faster startup, less GC work, a few traps](https://ticketguy.dev/blogs/2026-10-20-jdk27-memory/).
+
+The detailed results are in [RESULTS.md](RESULTS.md).
 
 It compares startup time, warm-up, memory footprint, GC, JIT and CPU usage of [alf.io](https://github.com/alfio-event/alf.io)
 in different Docker images, under the same fixed-throughput workload.

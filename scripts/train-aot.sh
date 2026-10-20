@@ -4,7 +4,8 @@
 # the JVM ignores an AOT cache created with different settings.
 #
 # Usage: train-aot.sh <base-image> <output-image> <rate> [training-seconds] [JVM options]
-#   e.g. train-aot.sh alfio-bench3:jdk27-aot alfio-bench3:jdk27-aot-workload 5 300 "-Xms384m -Xmx384m"
+#   e.g. train-aot.sh alfio-bench4:jdk27-aot alfio-bench4:jdk27-aot-workload 5 300 "-Xms256m -Xmx256m"
+# The training traffic uses another journey sequence (JOURNEY_SEED=1) than the measured runs (0).
 set -uo pipefail
 source "$(dirname "$0")/lib.sh"
 BASE_IMAGE=$1; OUTPUT_IMAGE=$2; RATE=$3; SECONDS_AT_RATE=${4:-300}; JVM_OPTS=${5:-}
@@ -17,17 +18,19 @@ docker rm -f "$CONTAINER" >/dev/null 2>&1
 $PG dropdb -U postgres --if-exists "$DB" 2>/dev/null
 $PG createdb -U postgres -T "$TEMPLATE_DB" "$DB" || exit 1
 
-# same command as the image CMD (including the GC of the image, ALFIO_GC_OPTS), with -XX:AOTCacheOutput instead of -XX:AOTCache.
-# "exec": java is PID 1 and receives SIGTERM from "docker stop", so it exits normally and writes the cache
-docker run -d --name "$CONTAINER" --network host --cpuset-cpus="$SERVER_CPUS" --memory=2g \
+# the image's own start script (same runtime, modules and JVM_OPTS as the measured runs), with -XX:AOTCacheOutput
+# instead of the startup-trained cache. "exec" in start.sh: java receives the SIGTERM of "docker stop", exits normally
+# and writes the cache. The container gets more memory than the measured runs: at exit, a second JVM assembles the cache
+docker update --cpuset-cpus="$DB_CPUS" alfio-main-postgres >/dev/null
+docker run -d --name "$CONTAINER" --network host --cpuset-cpus="$SERVER_CPUS" --memory="${TRAIN_MEM_LIMIT:-1g}" \
+  -e ALFIO_STARTUP_OVERRIDE="-XX:AOTCacheOutput=/out/alfio.aot" \
+  -e ALFIO_JAVA_OPTS="$JVM_OPTS -Dspring.profiles.active=dev -Ddatasource.url=jdbc:postgresql://localhost:5432/$DB -Ddatasource.username=postgres -Ddatasource.password=password" \
   -v "$ALFIO_DEV_PROPERTIES:/home/alfio/app/application-dev.properties:ro" -v "$OUT:/out" \
-  "$BASE_IMAGE" sh -c "exec /opt/jdk/bin/java \$ALFIO_GC_OPTS $JVM_OPTS -Dspring.jmx.enabled=false -Dlog4j2.disableJmx=true -XX:+UseContainerSupport \
-  -Dspring.profiles.active=dev -Ddatasource.url=jdbc:postgresql://localhost:5432/$DB -Ddatasource.username=postgres -Ddatasource.password=password \
-  --add-modules jdk.jfr -XX:AOTCacheOutput=/out/alfio.aot -jar alfio-boot.jar" >/dev/null || exit 1
+  "$BASE_IMAGE" >/dev/null || exit 1
 until curl -sf http://localhost:8080/healthz >/dev/null; do sleep 1; done
 
 echo "training at $RATE journeys/s for ${SECONDS_AT_RATE}s"
-gatling training "$RATE" 60 "$SECONDS_AT_RATE"
+JOURNEY_SEED=1 gatling training "$RATE" 60 "$SECONDS_AT_RATE"
 echo "gatling exit $?"
 
 # at exit the JVM records the training data, then a child JVM assembles the cache: give it time

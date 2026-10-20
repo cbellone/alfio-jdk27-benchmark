@@ -10,12 +10,12 @@ ROUNDS=${2:-3}
 for round in $(seq 1 "$ROUNDS"); do
   for config in "${CONFIGS[@]}"; do
     IFS='|' read -r name image opts <<< "$config"
-    if [ -f "$HERE/../results/load-$name-$round/load-end" ]; then
-      echo "=== load-$name-$round: already done"
+    if [ -f "$HERE/../results/${RUN_PREFIX}load-$name-$round/load-end" ]; then
+      echo "=== ${RUN_PREFIX}load-$name-$round: already done"
       continue
     fi
-    echo "=== $(date +%T) load-$name-$round"
-    "$HERE/run.sh" "$image" "load-$name-$round" "$RATE" "$opts"
+    echo "=== $(date +%T) ${RUN_PREFIX}load-$name-$round"
+    "$HERE/run.sh" "$image" "${RUN_PREFIX}load-$name-$round" "$RATE" "$opts"
   done
 done
 echo "SERIES-DONE $(date +%T)"

@@ -38,6 +38,7 @@ import static io.gatling.javaapi.http.HttpDsl.*;
  * Configuration (environment variables):
  * <ul>
  *     <li>{@code BASE_URL}, {@code API_KEY}, {@code EVENT}</li>
+ *     <li>{@code JOURNEY_SEED}: selects a different sequence of journeys (e.g. to train an AOT cache on other traffic than the measured one)</li>
  *     <li>{@code RATE}: journeys per second at steady state</li>
  *     <li>{@code RAMP_SECONDS}: linear ramp-up from 10% to 100% of {@code RATE}</li>
  *     <li>{@code STEADY_SECONDS}: duration at {@code RATE} (warm-up + measurement)</li>
@@ -51,6 +52,7 @@ public class PurchaseJourneySimulation extends Simulation {
     private static final String BASE_URL = env("BASE_URL", "http://localhost:8080");
     private static final String API_KEY = env("API_KEY", "");
     private static final String EVENT = env("EVENT", "load-bench");
+    private static final long JOURNEY_SEED = Long.parseLong(env("JOURNEY_SEED", "0"));
     private static final double RATE = Double.parseDouble(env("RATE", "1"));
     private static final Duration RAMP = Duration.ofSeconds(Long.parseLong(env("RAMP_SECONDS", "60")));
     private static final Duration STEADY = Duration.ofSeconds(Long.parseLong(env("STEADY_SECONDS", "300")));
@@ -73,7 +75,7 @@ public class PurchaseJourneySimulation extends Simulation {
     }
 
     private static Iterator<Map<String, Object>> journeys() {
-        return Stream.iterate(0L, i -> i + 1).map(i -> {
+        return Stream.iterate(JOURNEY_SEED * 1_000_000_000L, i -> i + 1).map(i -> {
             var random = new Random(i);
             Map<String, Object> journey = new HashMap<>();
             journey.put("journey", i);

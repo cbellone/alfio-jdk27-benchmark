@@ -10,12 +10,12 @@ for config in "${CONFIGS[@]}"; do
   if [ $# -gt 0 ] && [[ " $* " != *" $name "* ]]; then
     continue
   fi
-  if [ -f "$HERE/../results/capacity-$name/max-rate" ]; then
-    echo "=== capacity-$name: already done ($(cat "$HERE/../results/capacity-$name/max-rate") journeys/s)"
+  if [ -f "$HERE/../results/${RUN_PREFIX}capacity-$name/max-rate" ]; then
+    echo "=== ${RUN_PREFIX}capacity-$name: already done ($(cat "$HERE/../results/${RUN_PREFIX}capacity-$name/max-rate") journeys/s)"
     continue
   fi
-  echo "=== $(date +%T) capacity-$name"
-  "$HERE/capacity.sh" "$image" "capacity-$name" "$opts"
+  echo "=== $(date +%T) ${RUN_PREFIX}capacity-$name"
+  "$HERE/capacity.sh" "$image" "${RUN_PREFIX}capacity-$name" "$opts"
 done
-echo "slowest configuration: $(grep -H . "$HERE"/../results/capacity-*/max-rate | sort -t: -k2 -n | head -1)"
+echo "slowest configuration: $(grep -H . "$HERE"/../results/"${RUN_PREFIX}"capacity-*/max-rate | sort -t: -k2 -n | head -1)"
 echo "CAPACITY-DONE $(date +%T)"

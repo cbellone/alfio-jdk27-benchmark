@@ -29,8 +29,9 @@ import java.util.stream.Stream;
  * Extracts the metrics of every measured run (results/load-*) and compares the configurations.
  * Only the measurement window is considered, except for the "compilation (whole run)" metrics.
  * <p>
- * Usage: jbang analysis/Analyze.java results
- * Output: results/summary.csv (config,run,metric,value) and results/summary.md (medians per configuration)
+ * Usage: jbang analysis/Analyze.java results [run prefix, default "load-"]
+ * Output: results/load-summary.csv (config,run,metric,value), results/load-summary.md (medians per configuration)
+ * and results/load-timeline.csv
  */
 public class Analyze {
 
@@ -51,9 +52,15 @@ public class Analyze {
         if (args.length > 0) {
             root = Path.of(args[0]);
         }
+        // the runs to analyze: results/<prefix><config>-<n>
+        var prefix = "load-";
+        if (args.length > 1) {
+            prefix = args[1];
+        }
+        var runPrefix = prefix;
         List<Path> runs;
         try (Stream<Path> list = Files.list(root)) {
-            runs = list.filter(p -> p.getFileName().toString().startsWith("load-") && Files.exists(p.resolve("recording.jfr")))
+            runs = list.filter(p -> p.getFileName().toString().startsWith(runPrefix) && Files.exists(p.resolve("load-latencies.csv")))
                 .sorted()
                 .toList();
         }
@@ -64,16 +71,17 @@ public class Analyze {
         for (var run : runs) {
             var name = run.getFileName().toString();
             // load-aot-workload-1 -> aot-workload
-            var config = name.substring("load-".length(), name.lastIndexOf('-'));
+            var config = name.substring(prefix.length(), name.lastIndexOf('-'));
             System.err.println("analyzing " + name);
             var metrics = analyzeRun(run, config, timeline);
             results.computeIfAbsent(config, _ -> new TreeMap<>()).put(name, metrics);
             metrics.forEach((k, v) -> csv.append(config).append(',').append(name).append(',').append(k).append(',').append(v).append('\n'));
         }
-        Files.writeString(root.resolve("summary.csv"), csv);
-        Files.writeString(root.resolve("timeline.csv"), timeline);
+        var output = prefix.replaceAll("-$", "");
+        Files.writeString(root.resolve(output + "-summary.csv"), csv);
+        Files.writeString(root.resolve(output + "-timeline.csv"), timeline);
         var markdown = report(results);
-        Files.writeString(root.resolve("summary.md"), markdown);
+        Files.writeString(root.resolve(output + "-summary.md"), markdown);
         System.out.println(markdown);
     }
 
@@ -87,7 +95,15 @@ public class Analyze {
         var warmup = new Window(loadStart, measureStart - 1);
         Map<String, Double> metrics = new LinkedHashMap<>();
         startup(run, metrics);
-        jfr(run.resolve("recording.jfr"), window, warmup, metrics);
+        if (Files.exists(run.resolve("recording.jfr"))) {
+            jfr(run.resolve("recording.jfr"), window, warmup, metrics);
+        }
+        if (Files.exists(run.resolve("gc.log"))) {
+            long jvmStart = Long.parseLong(Files.readString(run.resolve("container-start-millis")).trim());
+            long loadEnd = 1000L * Long.parseLong(Files.readString(run.resolve("load-end")).trim());
+            gcLog(run.resolve("gc.log"), jvmStart, window, loadEnd, metrics);
+        }
+        containerState(run, metrics);
         if (Files.exists(run.resolve("pidstat.txt"))) {
             pidstat(run.resolve("pidstat.txt"), window, "cpu.", metrics);
             pidstat(run.resolve("pidstat.txt"), warmup, "warmup.cpu.", metrics);
@@ -328,12 +344,19 @@ public class Analyze {
         }
         // sample time -> component -> %CPU (sum over the threads of the component)
         Map<Long, Map<String, Double>> samples = new TreeMap<>();
+        var previousTime = LocalTime.MIN;
         for (var line : lines) {
             var fields = line.trim().split("\\s+");
             if (fields.length < 11 || line.startsWith("#") || !fields[0].matches("\\d\\d:\\d\\d:\\d\\d")) {
                 continue;
             }
-            long epoch = date.atTime(LocalTime.parse(fields[0])).atZone(ZoneId.systemDefault()).toInstant().toEpochMilli();
+            var time = LocalTime.parse(fields[0]);
+            // pidstat prints only the time: a run that crosses midnight continues on the next day
+            if (time.isBefore(previousTime)) {
+                date = date.plusDays(1);
+            }
+            previousTime = time;
+            long epoch = date.atTime(time).atZone(ZoneId.systemDefault()).toInstant().toEpochMilli();
             if (!window.contains(epoch)) {
                 continue;
             }
@@ -386,17 +409,101 @@ public class Analyze {
         metrics.put(prefix + "max_ms", percentile(ok, 100));
     }
 
+    /**
+     * memory.csv: epoch,cgroup_bytes,anon_bytes,file_bytes,java_rss_kb (or epoch,cgroup_bytes,java_rss_kb in older runs).
+     * The cgroup memory is split into anonymous memory (heap, metaspace, code, threads...) and file-backed memory
+     * (page cache, including the mapped CDS archive / AOT cache, which is reclaimable and shareable).
+     */
     private static void memorySamples(Path file, Window window, Map<String, Double> metrics) throws IOException {
-        var rss = new DoubleSummaryStatistics();
-        for (var line : Files.readAllLines(file).subList(1, Files.readAllLines(file).size())) {
-            var fields = line.split(",");
-            if (fields.length == 3 && !fields[2].isBlank() && window.contains(Long.parseLong(fields[0]) * 1000)) {
-                rss.accept(Double.parseDouble(fields[2]) / 1024);
+        var lines = Files.readAllLines(file);
+        var header = List.of(lines.getFirst().split(","));
+        Map<String, DoubleSummaryStatistics> stats = new LinkedHashMap<>();
+        for (var line : lines.subList(1, lines.size())) {
+            var fields = line.split(",", -1);
+            if (fields.length != header.size() || !window.contains(Long.parseLong(fields[0]) * 1000)) {
+                continue;
+            }
+            for (int i = 1; i < fields.length; i++) {
+                if (fields[i].isBlank()) {
+                    continue;
+                }
+                double mb = Double.parseDouble(fields[i]) / MB;
+                if (header.get(i).endsWith("_kb")) {
+                    mb = Double.parseDouble(fields[i]) / 1024;
+                }
+                stats.computeIfAbsent(header.get(i), _ -> new DoubleSummaryStatistics()).accept(mb);
             }
         }
-        if (rss.getCount() > 0) {
-            metrics.put("sampled.rss_avg_mb", rss.getAverage());
-            metrics.put("sampled.rss_max_mb", rss.getMax());
+        stats.forEach((column, s) -> {
+            var name = column.replaceAll("_(bytes|kb)$", "");
+            if (name.equals("java_rss")) {
+                name = "rss";
+            }
+            metrics.put("sampled." + name + "_avg_mb", s.getAverage());
+            metrics.put("sampled." + name + "_max_mb", s.getMax());
+        });
+    }
+
+    /**
+     * GC log (-Xlog:gc*:uptime): pauses in the measurement window, and the live data, i.e. the heap after the full GC
+     * forced with jcmd at the end of the load (the same measurement for every GC).
+     */
+    private static void gcLog(Path file, long jvmStart, Window window, long loadEnd, Map<String, Double> metrics) throws IOException {
+        // [123.456s] GC(42) Pause Young (Normal) (G1 Evacuation Pause) 150M->60M(256M) 12.345ms
+        var pause = Pattern.compile("^\\[([0-9.]+)s\\] GC\\(\\d+\\) Pause (\\S+)( \\(([^)]*)\\))?.* (\\d+)M->(\\d+)M\\((\\d+)M\\) ([0-9.]+)ms$");
+        var pauses = new ArrayList<Double>();
+        int full = 0;
+        double committed = 0;
+        for (var line : Files.readAllLines(file)) {
+            var m = pause.matcher(line);
+            if (!m.matches()) {
+                continue;
+            }
+            long epoch = jvmStart + (long) (Double.parseDouble(m.group(1)) * 1000);
+            // jcmd GC.run: "Diagnostic Command" (or "System.gc()", depending on the JDK)
+            if (("Diagnostic Command".equals(m.group(4)) || "System.gc()".equals(m.group(4))) && epoch >= loadEnd) {
+                metrics.put("gc.live_data_mb", Double.parseDouble(m.group(6)));
+            }
+            if (!window.contains(epoch)) {
+                continue;
+            }
+            pauses.add(Double.parseDouble(m.group(8)));
+            committed = Math.max(committed, Double.parseDouble(m.group(7)));
+            if (m.group(2).equals("Full")) {
+                full++;
+            }
+        }
+        metrics.put("gc.log.count", (double) pauses.size());
+        metrics.put("gc.log.full_count", (double) full);
+        metrics.put("gc.log.pause_total_ms", pauses.stream().mapToDouble(Double::doubleValue).sum());
+        metrics.put("gc.log.pause_max_ms", pauses.stream().mapToDouble(Double::doubleValue).max().orElse(0));
+        pauses.sort(Comparator.naturalOrder());
+        metrics.put("gc.log.pause_p99_ms", percentile(pauses, 99));
+        metrics.put("gc.log.heap_committed_max_mb", committed);
+    }
+
+    /**
+     * Peak cgroup memory, and whether the container was killed for exceeding its memory limit.
+     */
+    private static void containerState(Path run, Map<String, Double> metrics) throws IOException {
+        var peak = run.resolve("memory-peak");
+        if (Files.exists(peak)) {
+            metrics.put("cgroup.peak_mb", Double.parseDouble(Files.readString(peak).trim()) / MB);
+        }
+        var events = run.resolve("memory-events");
+        if (Files.exists(events)) {
+            var m = Pattern.compile("^oom_kill (\\d+)$", Pattern.MULTILINE).matcher(Files.readString(events));
+            if (m.find()) {
+                metrics.put("cgroup.oom_kills", Double.parseDouble(m.group(1)));
+            }
+        }
+        var state = run.resolve("container-state");
+        if (Files.exists(state)) {
+            double killed = 0;
+            if (Files.readString(state).contains("oom_killed=true")) {
+                killed = 1;
+            }
+            metrics.put("container.oom_killed", killed);
         }
     }
 
@@ -424,10 +531,7 @@ public class Analyze {
     private static String report(Map<String, Map<String, Map<String, Double>>> results) {
         var configs = new ArrayList<>(results.keySet());
         // the baseline goes first
-        var baseline = "old";
-        if (!configs.contains(baseline)) {
-            baseline = configs.getFirst();
-        }
+        var baseline = configs.stream().filter(c -> c.startsWith("jdk25")).findFirst().orElse(configs.getFirst());
         configs.remove(baseline);
         configs.addFirst(baseline);
         var out = new StringBuilder("\nMedians per configuration (runs: ");

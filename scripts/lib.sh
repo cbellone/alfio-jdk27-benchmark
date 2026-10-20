@@ -4,7 +4,6 @@
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 ROOT=$(cd "$HERE/.." && pwd)
 TEMPLATE_DB=${TEMPLATE_DB:-alfio_load_template}
-PG="docker exec alfio-main-postgres"
 # Gatling runs inside Gradle's JVM, which must be Java 25+ (the simulation is compiled for Java 25).
 # Set BENCH_JAVA_HOME when the default JAVA_HOME points to an older JDK.
 if [ -n "${BENCH_JAVA_HOME:-}" ]; then
@@ -19,6 +18,19 @@ fi
 # the server gets 2 dedicated CPUs, the load generator runs on the others (adjust them to your machine)
 SERVER_CPUS=${SERVER_CPUS:-2,3}
 LOADGEN_CPUS=${LOADGEN_CPUS:-4-13}
+# PostgreSQL gets its own CPUs, so that it never competes with the server
+DB_CPUS=${DB_CPUS:-0,1}
+PG="docker exec alfio-main-postgres"
+# the scenario (see configs.sh) and the memory limit of the server container
+SCENARIO=${SCENARIO:-container}
+MEM_LIMIT=${MEM_LIMIT:-512m}
+# light: GC log only, the numbers to compare. jfr: also JFR and NMT, to explain them (they need memory of their own)
+# alloc: JFR with the allocations outside the TLABs (e.g. the humongous objects of G1), with stack traces
+PROFILE=${PROFILE:-light}
+# the user of the server container, e.g. the uid of the current user, so that perf can attach to the JVM
+CONTAINER_USER=${CONTAINER_USER:-}
+# seed of the journey sequence (the workload training uses a different one)
+JOURNEY_SEED=${JOURNEY_SEED:-0}
 
 # start_server <image> <run-name> [extra JVM options]
 # sets OUT, CONTAINER, DB, JAVA_PID, PIDSTAT, SAMPLER
@@ -32,35 +44,60 @@ start_server() {
   $PG dropdb -U postgres --if-exists "$DB" 2>/dev/null
   $PG createdb -U postgres -T "$TEMPLATE_DB" "$DB" || return 1
 
-  # JFR records every compilation (threshold 0ms); maxsize avoids losing the beginning of long recordings
+  docker update --cpuset-cpus="$DB_CPUS" alfio-main-postgres >/dev/null
+
   local java_opts="-Dspring.profiles.active=dev \
  -Ddatasource.url=jdbc:postgresql://localhost:5432/$DB -Ddatasource.username=postgres -Ddatasource.password=password \
+ -Xlog:gc*:file=/out/gc.log:uptime"
+  if [ "$PROFILE" = "jfr" ]; then
+    # JFR records every compilation (threshold 0ms); maxsize avoids losing the beginning of long recordings
+    java_opts="$java_opts \
  -XX:StartFlightRecording=filename=/out/recording.jfr,settings=profile,maxsize=4g,dumponexit=true,jdk.Compilation#threshold=0ms \
- -XX:NativeMemoryTracking=summary -XX:+UnlockDiagnosticVMOptions -XX:+PrintNMTStatistics \
- -Xlog:gc*:file=/out/gc.log:uptime $extra_opts"
-  echo "image=$image extra_opts=$extra_opts" > "$OUT/config.txt"
+ -XX:NativeMemoryTracking=summary -XX:+UnlockDiagnosticVMOptions -XX:+PrintNMTStatistics"
+  fi
+  if [ "$PROFILE" = "alloc" ]; then
+    java_opts="$java_opts \
+ -XX:StartFlightRecording=filename=/out/recording.jfr,settings=default,maxsize=4g,dumponexit=true,jdk.ObjectAllocationOutsideTLAB#enabled=true,jdk.ObjectAllocationOutsideTLAB#stackTrace=true"
+  fi
+  java_opts="$java_opts $extra_opts"
+  local user_opts=()
+  if [ -n "$CONTAINER_USER" ]; then
+    user_opts=(--user "$CONTAINER_USER")
+  fi
+  echo "image=$image extra_opts=$extra_opts profile=$PROFILE scenario=$SCENARIO limits=--memory=$MEM_LIMIT user=$CONTAINER_USER seed=$JOURNEY_SEED" > "$OUT/config.txt"
 
   date +%s%3N > "$OUT/container-start-millis"
-  docker run -d --name "$CONTAINER" --network host --cpuset-cpus="$SERVER_CPUS" --memory=2g \
+  docker run -d --name "$CONTAINER" --network host --cpuset-cpus="$SERVER_CPUS" --memory="$MEM_LIMIT" "${user_opts[@]}" \
     -e ALFIO_JAVA_OPTS="$java_opts" \
     -v "$ALFIO_DEV_PROPERTIES:/home/alfio/app/application-dev.properties:ro" \
     -v "$OUT:/out" "$image" >/dev/null || return 1
 
   # poll often: the time to the first successful health check is a startup metric
-  until curl -sf http://localhost:8080/healthz >/dev/null; do sleep 0.1; done
+  until curl -sf http://localhost:8080/healthz >/dev/null; do
+    if [ "$(docker inspect -f '{{.State.Running}}' "$CONTAINER" 2>/dev/null)" != "true" ]; then
+      echo "server container died during startup, see $OUT/container.log" >&2
+      docker logs "$CONTAINER" > "$OUT/container.log" 2>&1
+      return 1
+    fi
+    sleep 0.1
+  done
   date +%s%3N > "$OUT/ready-millis"
   JAVA_PID=$(docker top "$CONTAINER" -o pid,comm | awk '$2=="java" {print $1}')
+  CGROUP="/sys/fs/cgroup$(sed -n 's/^0:://p' "/proc/$JAVA_PID/cgroup")"
 
   # per-thread CPU usage, every 5 seconds
   S_TIME_FORMAT=ISO pidstat -t -u -h -p "$JAVA_PID" 5 > "$OUT/pidstat.txt" &
   PIDSTAT=$!
 
-  # resident memory of the java process + cgroup memory, every 2 seconds
+  # cgroup memory (anonymous vs file-backed: the mapped CDS archive / AOT cache is file-backed, reclaimable and shareable)
+  # and resident memory of the java process, every 2 seconds
   (
-    echo "epoch,cgroup_bytes,java_rss_kb" > "$OUT/memory.csv"
+    echo "epoch,cgroup_bytes,anon_bytes,file_bytes,java_rss_kb" > "$OUT/memory.csv"
     # kill -0 is not allowed on a process of another user (the container runs as uid 1001)
     while [ -d "/proc/$JAVA_PID" ]; do
-      echo "$(date +%s),$(docker exec "$CONTAINER" cat /sys/fs/cgroup/memory.current 2>/dev/null),$(grep VmRSS /proc/"$JAVA_PID"/status 2>/dev/null | awk '{print $2}')" >> "$OUT/memory.csv"
+      local stat
+      stat=$(awk '$1=="anon" {a=$2} $1=="file" {f=$2} END {print a "," f}' "$CGROUP/memory.stat" 2>/dev/null)
+      echo "$(date +%s),$(cat "$CGROUP/memory.current" 2>/dev/null),$stat,$(grep VmRSS /proc/"$JAVA_PID"/status 2>/dev/null | awk '{print $2}')" >> "$OUT/memory.csv"
       sleep 2
     done
   ) &
@@ -71,7 +108,7 @@ start_server() {
 # returns Gatling's exit code (non-zero when an assertion fails)
 gatling() {
   local prefix=$1 rate=$2 ramp=$3 steady=$4 assert_p95=${5:-}
-  (cd "$ROOT" && BASE_URL=http://localhost:8080 API_KEY=$(cat "$ROOT/results/api-key.txt") RATE=$rate \
+  (cd "$ROOT" && BASE_URL=http://localhost:8080 API_KEY=$(cat "$ROOT/results/api-key.txt") RATE=$rate JOURNEY_SEED=$JOURNEY_SEED \
     RAMP_SECONDS=$ramp STEADY_SECONDS=$steady ASSERT_P95_MS=$assert_p95 \
     START_MARKER="$OUT/$prefix-start-millis" LATENCY_LOG="$OUT/$prefix-latencies.csv" \
     taskset -c "$LOADGEN_CPUS" ./gradlew --no-daemon --console=plain gatlingRun --simulation alfio.bench.PurchaseJourneySimulation \
@@ -81,7 +118,26 @@ gatling() {
   return $status
 }
 
+# server_alive: false when the container was killed (e.g. out of memory)
+server_alive() {
+  [ "$(docker inspect -f '{{.State.Running}}' "$CONTAINER" 2>/dev/null)" = "true" ]
+}
+
+# live_data: forces a full GC, so that the GC log reports the live data in the same way for every GC
+# (java is PID 1 of the container, see start.sh; jcmd must run as the same user)
+live_data() {
+  local user_opts=()
+  if [ -n "$CONTAINER_USER" ]; then
+    user_opts=(--user "$CONTAINER_USER")
+  fi
+  docker exec "${user_opts[@]}" "$CONTAINER" /opt/jdk/bin/jcmd 1 GC.run > "$OUT/live-data.txt" 2>&1
+  docker exec "${user_opts[@]}" "$CONTAINER" /opt/jdk/bin/jcmd 1 GC.heap_info >> "$OUT/live-data.txt" 2>&1
+}
+
 stop_server() {
+  cp "$CGROUP/memory.peak" "$OUT/memory-peak" 2>/dev/null
+  cp "$CGROUP/memory.events" "$OUT/memory-events" 2>/dev/null
+  docker inspect -f 'oom_killed={{.State.OOMKilled}} exit_code={{.State.ExitCode}}' "$CONTAINER" > "$OUT/container-state" 2>/dev/null
   docker stop -t 120 "$CONTAINER" >/dev/null
   kill "$PIDSTAT" 2>/dev/null
   wait "$SAMPLER" 2>/dev/null
